@@ -25,3 +25,9 @@
 /input.ini
 
 .DS_Store
+
+# Android build output and machine-local SDK path
+/android/.gradle/
+/android/app/build/
+/android/app/.cxx/
+/android/local.properties

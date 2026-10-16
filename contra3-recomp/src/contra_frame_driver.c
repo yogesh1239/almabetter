@@ -20,6 +20,7 @@
 #include "snes/interp_bridge.h"
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 #include "common_cpu_infra.h"
@@ -51,6 +52,61 @@ static uint32_t s_resume_pc;
 
 /* The CPU executed WAI and is halted until an interrupt line asserts. */
 static bool s_wai_halted;
+
+/* ── Idle parking ────────────────────────────────────────────────────────────
+ * Contra III spends most of every field in two polls that only an interrupt
+ * can satisfy:
+ *
+ *   $00:8166  main thread: JSL $995A / BRA $8166, where $995A returns at once
+ *             unless the NMI side has posted a job ($52 == $00FF).
+ *   $00:85EC  inside the NMI handler: LDA $003C / BMI $85EC, waiting for the
+ *             nested NMI to clear bit 7.
+ *
+ * Interpreting those spins cost ~45% of all guest instructions. At either PC,
+ * with the poll's condition still unmet, nothing in the machine depends on
+ * the CPU until an interrupt arrives, so the CPU is parked exactly like WAI:
+ * the beam, APU and HDMA run on, raster IRQs are still taken where they
+ * latch, and the handler returns into the same poll. The checks pin the
+ * register widths, direct page and data bank the polls run with, so any other
+ * path through these PCs interprets normally. */
+extern uint8_t g_ram[0x20000];
+static bool s_idle;
+
+static bool db_maps_low_wram(uint8_t db) {
+  return (db & 0x7f) < 0x40;
+}
+
+static void idle_hook(CpuState *cpu, uint32_t pc24) {
+  bool idle = false;
+  switch (pc24 & 0x7fffffu) {
+  case 0x008166: /* JSL $995A: REP #$20 / LDA $52 / CMP #$00FF / BNE rtl */
+    idle = cpu->D == 0 && !cpu->emulation &&
+           (g_ram[0x52] | (g_ram[0x53] << 8)) != 0x00ff;
+    break;
+  case 0x0085EC: /* LDA $003C (8-bit) / BMI $85EC */
+    idle = cpu->m_flag && !cpu->emulation && db_maps_low_wram(cpu->DB) &&
+           (g_ram[0x3c] & 0x80);
+    break;
+  }
+  if (!idle)
+    return;
+  /* Yield before this instruction: the deadline check at the top of the
+   * interpreter loop fires on the redirect back to the same PC. */
+  s_idle = true;
+  interp_bridge_set_master_deadline(cpu->master_cycles);
+  interp_bridge_pre_opcode_redirect(pc24);
+}
+
+static void idle_hooks_install(void) {
+  static bool installed;
+  if (installed)
+    return;
+  installed = true;
+  if (getenv("CONTRA_NO_IDLE_PARK"))
+    return;
+  interp_bridge_add_pre_opcode_hook(0x008166, idle_hook);
+  interp_bridge_add_pre_opcode_hook(0x0085EC, idle_hook);
+}
 
 static uint32_t read_vector(uint32_t addr) {
   /* Through the guest bus, so a mapper or coprocessor window resolves the
@@ -144,6 +200,7 @@ void contra_frame_driver_run_frame(void) {
   }
 
   if (booting) {
+    idle_hooks_install();
     s_resume_pc = reset_vector();
   } else {
     /* Vblank-edge PPU work a frame-model host owns: OAMADDR re-latches. */
@@ -188,6 +245,10 @@ void contra_frame_driver_run_frame(void) {
       update_resume_pc();
       if (interp_bridge_lle_took_wai())
         s_wai_halted = true;
+      if (s_idle) {
+        s_idle = false;
+        s_wai_halted = true;
+      }
     }
     /* Past the boundary, an interrupt belongs to the next frame. Delivering
      * one with the deadline already spent made the handler yield on its first
@@ -247,4 +308,5 @@ void contra_frame_driver_run_frame(void) {
 void contra_frame_driver_reset(void) {
   s_resume_pc = 0;
   s_wai_halted = false;
+  s_idle = false;
 }

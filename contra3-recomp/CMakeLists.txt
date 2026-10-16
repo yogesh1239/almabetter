@@ -36,7 +36,7 @@ set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
     "Mod package loader + trusted plugins (required for every title)" FORCE)
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
-add_executable(ContraIiiSNESRecomp
+set(CONTRA_SOURCES
     ${SNESRECOMP_RUNNER_SOURCES}
     src/main.c
     src/host_contract.c
@@ -45,6 +45,14 @@ add_executable(ContraIiiSNESRecomp
     src/contra_interp.c
     src/gen_stubs.c
 )
+if(ANDROID)
+    # SDLActivity loads libmain.so and calls its SDL_main; the touch pad and
+    # ROM path arrive through contra_android.c (android/ holds the app).
+    add_library(ContraIiiSNESRecomp SHARED ${CONTRA_SOURCES} src/contra_android.c)
+    set_target_properties(ContraIiiSNESRecomp PROPERTIES OUTPUT_NAME main)
+else()
+    add_executable(ContraIiiSNESRecomp ${CONTRA_SOURCES})
+endif()
 
 # ROM identity. rom_identity.txt is the one place the digests live: the build
 # turns it into snesrecomp_rom_identity.h (SNESRECOMP_ROM_EXPECTED_SHA256 and

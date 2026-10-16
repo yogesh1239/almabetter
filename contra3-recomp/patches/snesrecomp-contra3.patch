@@ -1,5 +1,5 @@
 diff --git a/runner/src/desktop/host_main.c b/runner/src/desktop/host_main.c
-index 3bc3905..bc314f3 100644
+index 3bc3905..f22afe8 100644
 --- a/runner/src/desktop/host_main.c
 +++ b/runner/src/desktop/host_main.c
 @@ -418,7 +418,8 @@ static uint64_t g_state_generation;
@@ -34,8 +34,20 @@ index 3bc3905..bc314f3 100644
    uint8 *present_buffer = 0;
    int present_pitch = 0;
  
+@@ -4206,7 +4211,10 @@ error_reading:;
+      * being skipped costs work for a picture nobody is reading. */
+     bool runahead_captured = false;
+     {
+-      const uint32 word = inputs | GetActiveControllers() | debug_server_get_controller_active_mask();
++      uint32 extra = 0;
++      if (game->extra_inputs)
++        extra = (game->extra_inputs() & 0xfffu) | (1u << 30);
++      const uint32 word = inputs | extra | GetActiveControllers() | debug_server_get_controller_active_mask();
+       if (g_turbo || !snes_runahead_run_frame(word))
+         RtlRunFrame(word);
+       else
 diff --git a/runner/src/desktop/host_main.h b/runner/src/desktop/host_main.h
-index 03b6f06..ca9cd2a 100644
+index 03b6f06..029280e 100644
 --- a/runner/src/desktop/host_main.h
 +++ b/runner/src/desktop/host_main.h
 @@ -41,6 +41,7 @@
@@ -46,7 +58,7 @@ index 03b6f06..ca9cd2a 100644
  
  #ifdef __cplusplus
  extern "C" {
-@@ -197,6 +198,10 @@ typedef struct SnesDesktopHostGame {
+@@ -197,6 +198,13 @@ typedef struct SnesDesktopHostGame {
    /* After the gameplay loop ends, before SDL resources are destroyed or a
     * relaunch begins. Stop title-owned workers here. No further frames run. */
    void (*on_shutdown)(void);
@@ -54,6 +66,9 @@ index 03b6f06..ca9cd2a 100644
 +   * draw_frame must fill all of it (its pitch says so). NULL or a return
 +   * outside 2..kSnesDesktopMaxRenderScale presents at native size. */
 +  int (*render_scale)(void);
++  /* Extra player-1 buttons OR-ed into the pad each frame (SNES_PAD_* bits),
++   * e.g. an on-screen touch pad. Non-NULL also marks seat 1 as connected. */
++  uint32_t (*extra_inputs)(void);
  } SnesDesktopHostGame;
  
  /* The whole program. Returns the process exit code. */

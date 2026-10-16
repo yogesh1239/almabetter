@@ -34,13 +34,40 @@
 
 #include "game_rtl.h"
 
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "beam_frame_driver.h"
 #include "contra_frame_driver.h"
 #include "contra_interp.h"
+#include "desktop/sdl_compat.h"
+
+extern uint8_t g_ram[0x20000];
 
 void GameRunOneFrame(void)
 {
+    const uint64_t t0 = SDL_GetPerformanceCounter();
     contra_frame_driver_run_frame();
+    contra_interp_note_sim_ms(1000.0 * (double)(SDL_GetPerformanceCounter() - t0) /
+                              (double)SDL_GetPerformanceFrequency());
+    /* CONTRA_RAM_DUMP_DIR=<dir>: WRAM every 100 frames, for A/B validation
+     * of frame-driver changes. */
+    static const char *dump_dir;
+    static int checked, frame;
+    if (!checked) {
+        checked = 1;
+        dump_dir = getenv("CONTRA_RAM_DUMP_DIR");
+    }
+    if (dump_dir && (++frame % 100) == 0) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/wram_%06d.bin", dump_dir, frame);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(g_ram, 1, sizeof g_ram, f);
+            fclose(f);
+        }
+    }
 }
 
 void GameDrawPpuFrame(void)

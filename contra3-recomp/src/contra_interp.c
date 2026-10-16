@@ -36,8 +36,21 @@
  * Settings: contra3.ini beside the executable, overridden by the environment.
  *   [Video]
  *   Interpolation = 1        ; CONTRA_INTERP      0 = present at 60 Hz
- *   InternalResolution = 2   ; CONTRA_RES         1..4
+ *   InternalResolution = 0   ; CONTRA_RES         0 = auto from the window
+ *                            ;                    height (4x at 1080p+), 1..4
  *   PresentationHz = 0       ; CONTRA_FPS         0 = display refresh rate
+ *   AutoQuality = 1          ; CONTRA_AUTOQ       governor, see below
+ *
+ * Quality governor: the presenter must never cost the simulation its 60 Hz.
+ * It measures the guest frame and each present, estimates the share of one
+ * core the main thread needs per second, and walks a ladder of levels:
+ *   0  full: N x N sub-pixel phases at the display rate
+ *   1  2 x 2 phases            2  1 phase (whole-pixel interpolation)
+ *   3  presentation capped at 120 Hz
+ *   4  interpolation off (60 Hz), internal resolution kept (one pass)
+ *   5  native 256 x 224 output, the GPU scales it
+ * Down a level when the load passes 85%, back up after it has stayed under
+ * 45% for a while.
  */
 #include "contra_interp.h"
 
@@ -105,9 +118,22 @@ static unsigned s_draw_number;
 static struct {
   bool loaded;
   int interp;
-  int scale;
+  int scale; /* 0 = auto */
   double hz;
+  int autoq;
 } s_cfg;
+
+/* Window height in pixels, from the host's prepare_frame. */
+static int s_drawable_h;
+
+/* Governor state. */
+enum { kLevelMax = 5 };
+static int s_level;
+static double s_sim_ms_ema = 4, s_draw_ms_ema;
+static uint64_t s_window_start, s_presents_in_window;
+static double s_presents_per_sec;
+static double s_cool_until;
+static double s_low_since = -1;
 
 /* A rasterizer: a private PPU copy and one native pass buffer. The calling
  * thread owns worker 0; the rest belong to the pool below. */
@@ -128,6 +154,7 @@ static void cfg_set(const char *key, const char *val) {
   if (!strcmp(key, "interpolation")) s_cfg.interp = atoi(val) != 0;
   else if (!strcmp(key, "internalresolution")) s_cfg.scale = atoi(val);
   else if (!strcmp(key, "presentationhz")) s_cfg.hz = atof(val);
+  else if (!strcmp(key, "autoquality")) s_cfg.autoq = atoi(val) != 0;
 }
 
 static void cfg_load_ini(const char *path) {
@@ -156,8 +183,9 @@ static void cfg_load(void) {
     return;
   s_cfg.loaded = true;
   s_cfg.interp = 1;
-  s_cfg.scale = 2;
+  s_cfg.scale = 0;
   s_cfg.hz = 0;
+  s_cfg.autoq = 1;
   char *base = (char *)SDL_GetBasePath();
   if (base) {
     char path[1024];
@@ -171,15 +199,103 @@ static void cfg_load(void) {
   if ((v = getenv("CONTRA_INTERP"))) cfg_set("interpolation", v);
   if ((v = getenv("CONTRA_RES"))) cfg_set("internalresolution", v);
   if ((v = getenv("CONTRA_FPS"))) cfg_set("presentationhz", v);
-  if (s_cfg.scale < 1) s_cfg.scale = 1;
+  if ((v = getenv("CONTRA_AUTOQ"))) cfg_set("autoquality", v);
+  /* CONTRA_LEVEL=<0..5>: pin a governor level (testing). */
+  if ((v = getenv("CONTRA_LEVEL"))) {
+    s_level = atoi(v);
+    if (s_level < 0) s_level = 0;
+    if (s_level > kLevelMax) s_level = kLevelMax;
+    s_cfg.autoq = 0;
+  }
+  if (s_cfg.scale < 0) s_cfg.scale = 0;
   if (s_cfg.scale > kMaxScale) s_cfg.scale = kMaxScale;
-  fprintf(stderr, "[contra3] interpolation=%d internal_resolution=%dx presentation_hz=%s\n",
-          s_cfg.interp, s_cfg.scale, s_cfg.hz > 0 ? "fixed" : "display");
+  fprintf(stderr, "[contra3] interpolation=%d internal_resolution=%s%d presentation_hz=%s auto_quality=%d\n",
+          s_cfg.interp, s_cfg.scale ? "" : "auto,max", s_cfg.scale ? s_cfg.scale : kMaxScale,
+          s_cfg.hz > 0 ? "fixed" : "display", s_cfg.autoq);
 }
 
 static bool enhanced(void) {
   cfg_load();
-  return s_cfg.interp || s_cfg.scale > 1;
+  return s_cfg.interp || s_cfg.scale != 1;
+}
+
+static double now_ms(void) {
+  return 1000.0 * (double)SDL_GetPerformanceCounter() /
+         (double)SDL_GetPerformanceFrequency();
+}
+
+/* ── quality governor ────────────────────────────────────────────────────── */
+
+/* Output scale the configuration asks for before the governor. */
+static int wanted_scale(void) {
+  if (s_cfg.scale > 0)
+    return s_cfg.scale;
+  int h = s_drawable_h > 0 ? s_drawable_h : 224 * 3;
+  int n = (h + 223) / 224; /* enough rows to cover the window */
+  return n < 1 ? 1 : n > kMaxScale ? kMaxScale : n;
+}
+
+static int level_scale(void) {
+  return s_level >= 5 ? 1 : wanted_scale();
+}
+
+static int level_phases(int scale) {
+  int cap = s_level == 0 ? kMaxScale : s_level == 1 ? 2 : 1;
+  return scale < cap ? scale : cap;
+}
+
+static bool level_interp(void) {
+  return s_cfg.interp && s_level < 4;
+}
+
+static double level_hz_cap(void) {
+  return s_level >= 3 ? 120 : 0;
+}
+
+void contra_interp_note_sim_ms(double ms) {
+  s_sim_ms_ema += (ms - s_sim_ms_ema) * 0.05;
+}
+
+void contra_interp_prepare_frame(int drawable_w, int drawable_h, int *frame_w,
+                                 int *frame_h) {
+  (void)drawable_w; (void)frame_w; (void)frame_h;
+  s_drawable_h = drawable_h;
+}
+
+static void governor_present(double draw_ms) {
+  s_draw_ms_ema += (draw_ms - s_draw_ms_ema) * 0.05;
+  const double t = now_ms();
+  s_presents_in_window++;
+  if (!s_window_start)
+    s_window_start = (uint64_t)t;
+  if (t - (double)s_window_start < 500)
+    return;
+  s_presents_per_sec = s_presents_in_window * 1000.0 / (t - (double)s_window_start);
+  s_window_start = (uint64_t)t;
+  s_presents_in_window = 0;
+  if (!s_cfg.autoq || t < s_cool_until)
+    return;
+
+  /* Main-thread busy fraction: 60 guest frames plus every present. */
+  const double load = (60.1 * s_sim_ms_ema +
+                       s_presents_per_sec * s_draw_ms_ema) / 1000.0;
+  if (load > 0.85 && s_level < kLevelMax) {
+    s_level++;
+    s_cool_until = t + 1500;
+    s_low_since = -1;
+    fprintf(stderr, "[contra3] quality level %d (load %.0f%%)\n", s_level, load * 100);
+  } else if (load < 0.45 && s_level > 0) {
+    if (s_low_since < 0) {
+      s_low_since = t;
+    } else if (t - s_low_since > 8000) {
+      s_level--;
+      s_cool_until = t + 3000;
+      s_low_since = -1;
+      fprintf(stderr, "[contra3] quality level %d (load %.0f%%)\n", s_level, load * 100);
+    }
+  } else {
+    s_low_since = -1;
+  }
 }
 
 /* ── capture ─────────────────────────────────────────────────────────────── */
@@ -409,25 +525,33 @@ typedef struct RenderJob {
   int scale, phases, frame_h;
 } RenderJob;
 
-/* Render phase `k` of `job` and weave it into the destination. Phases write
- * disjoint pixels, so workers never touch the same destination word. */
+/* Render phase `k` of `job` and weave it into the destination. Output
+ * sub-pixel j (0..scale-1) takes phase j * phases / scale, so each phase owns
+ * a disjoint set of output pixels and workers never touch the same word. */
 static void job_phase(Raster *r, const RenderJob *job, int k) {
   const int phases = job->phases, scale = job->scale;
-  const int px = k % phases, py = k / phases, block = scale / phases;
+  const int px = k % phases, py = k / phases;
   const double fx = (px + 0.5) / phases, fy = (py + 0.5) / phases;
+  int cols[kMaxScale], ncols = 0, rows[kMaxScale], nrows = 0;
+  for (int j = 0; j < scale; j++) {
+    if (j * phases / scale == px) cols[ncols++] = j;
+    if (j * phases / scale == py) rows[nrows++] = j;
+  }
   render_pass(r, job->c, fx, fy, k == 0 ? scale : 1);
   for (int y = 0; y < job->frame_h; y++) {
     const uint32_t *src = (const uint32_t *)(r->pass + (size_t)y * 256 * 4);
-    for (int by = 0; by < block; by++) {
+    for (int ri = 0; ri < nrows; ri++) {
       uint32_t *row = (uint32_t *)(job->dst +
-                                   (size_t)(y * scale + py + by) * job->pitch);
-      if (block == 1) {
-        for (int x = 0; x < 256; x++)
-          row[x * scale + px] = src[x];
+                                   (size_t)(y * scale + rows[ri]) * job->pitch);
+      if (scale == 1) {
+        memcpy(row, src, 256 * 4);
+      } else if (ncols == 1) {
+        for (int x = 0, j = cols[0]; x < 256; x++, j += scale)
+          row[j] = src[x];
       } else {
         for (int x = 0; x < 256; x++)
-          for (int bx = 0; bx < block; bx++)
-            row[x * scale + bx] = src[x];
+          for (int ci = 0; ci < ncols; ci++)
+            row[x * scale + cols[ci]] = src[x];
       }
     }
   }
@@ -520,18 +644,21 @@ static void run_job(const RenderJob *job) {
 
 double contra_interp_presentation_hz(double display_refresh) {
   cfg_load();
-  if (!s_cfg.interp)
+  if (!level_interp())
     return 0;
-  if (s_cfg.hz > 0)
-    return s_cfg.hz;
-  if (display_refresh <= 0)
+  double hz = s_cfg.hz > 0 ? s_cfg.hz : display_refresh;
+  if (hz <= 0)
     return 1; /* "yes, decouple": the real rate is asked again with a window */
-  return display_refresh;
+  double cap = level_hz_cap();
+  if (cap > 0 && hz > cap)
+    hz = cap;
+  /* Nothing to interpolate at or below the simulation rate. */
+  return hz > 61 ? hz : 0;
 }
 
 int contra_interp_render_scale(void) {
   cfg_load();
-  return s_cfg.scale;
+  return level_scale();
 }
 
 int contra_interp_draw_frame(uint8_t *dst, size_t pitch, const uint8_t *field,
@@ -541,10 +668,11 @@ int contra_interp_draw_frame(uint8_t *dst, size_t pitch, const uint8_t *field,
     return 0;
   /* The host sizes the destination for the scale it actually granted; a
    * thumbnail asks for native size. */
-  int scale = s_cfg.scale;
+  const double t0 = now_ms();
+  int scale = level_scale();
   while (scale > 1 && pitch < (size_t)256 * scale * 4)
     scale--;
-  const bool interp = s_cfg.interp && alpha < 0.999;
+  const bool interp = level_interp() && alpha < 0.999;
   if (scale == 1 && !interp)
     return 0;
 
@@ -572,7 +700,8 @@ int contra_interp_draw_frame(uint8_t *dst, size_t pitch, const uint8_t *field,
   /* N x N phase passes, interleaved. Phase k samples at (k + 0.5) / N
    * inside the native pixel. On a whole field (a == 1) every position is an
    * integer, all phases agree, and one pass fills each N x N block. */
-  RenderJob job = {c, dst, pitch, scale, a < 1 ? scale : 1, frame_h};
+  RenderJob job = {c, dst, pitch, scale, a < 1 ? level_phases(scale) : 1,
+                   frame_h};
   run_job(&job);
   /* Mode 7 scanlines: the HD sampler's picture replaces the phase weave. */
   if (scale > 1) {
@@ -596,5 +725,6 @@ int contra_interp_draw_frame(uint8_t *dst, size_t pitch, const uint8_t *field,
       fprintf(stderr, "[interp] field=%u a=%.3f scale=%d bg1=%.2f bg2=%.2f sprites=%d\n",
               c->number, a, scale, s_pose[160].h[0], s_pose[160].h[1], moved);
   }
+  governor_present(now_ms() - t0);
   return 1;
 }

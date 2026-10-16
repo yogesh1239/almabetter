@@ -28,6 +28,10 @@
 #include "host_main.h"
 #include "game_rtl.h"
 #include "contra_interp.h"
+#include "default_config.h"
+#ifdef __ANDROID__
+#include "contra_android.h"
+#endif
 #include "snesrecomp_rom_identity.h"  /* generated from rom_identity.txt */
 
 #ifndef __ANDROID__
@@ -57,6 +61,7 @@ static const SnesDesktopHostGame kGameHost = {
     /* Battery-backed SRAM shows the launcher's SAVES panel. Leave NULL for a
      * title without one. The path is exe-relative. */
     .sram_path           = "saves/save.srm",
+    .default_config_ini  = kContraDefaultConfigIni,
     /* Simulation stays at 60.1 Hz; presentation runs at the display rate
      * with re-rasterized in-between fields, at the chosen internal
      * resolution (contra_interp.c). */
@@ -64,6 +69,10 @@ static const SnesDesktopHostGame kGameHost = {
     .draw_frame          = contra_interp_draw_frame,
     .on_reset            = contra_interp_reset,
     .render_scale        = contra_interp_render_scale,
+    .prepare_frame       = contra_interp_prepare_frame,
+#ifdef __ANDROID__
+    .extra_inputs        = contra_android_touch_inputs,
+#endif
 };
 
 #ifndef __ANDROID__

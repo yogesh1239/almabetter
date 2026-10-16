@@ -9,6 +9,10 @@ void contra_interp_draw_ppu_frame(void);
 void contra_interp_reset(void);
 double contra_interp_presentation_hz(double display_refresh);
 int contra_interp_render_scale(void);
+void contra_interp_prepare_frame(int drawable_w, int drawable_h, int *frame_w,
+                                 int *frame_h);
+/* Wall time of one simulated guest frame, for the quality governor. */
+void contra_interp_note_sim_ms(double ms);
 int contra_interp_draw_frame(uint8_t *dst, size_t pitch, const uint8_t *field,
                              int frame_w, int frame_h, double alpha);
 
