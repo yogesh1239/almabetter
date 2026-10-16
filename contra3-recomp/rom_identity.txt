@@ -1,0 +1,26 @@
+# ROM identity for Contra III — the single source of truth.
+#
+# Read by three consumers, so a revision change is made once, here:
+#   - the build   (CMake generates snesrecomp_rom_identity.h from this file)
+#   - tools/regen.sh
+#   - .github/workflows/release.yml
+#
+# Format is `key = value`, one per line; `#` starts a comment. Values may be
+# quoted. Leaving a digest empty means the build cannot verify a ROM it is
+# handed — it will say so rather than accept it.
+
+display_name    = Contra III
+rom_file        = Contra III - The Alien Wars (USA).sfc
+# Every digest of the bare image (copier header stripped), so the Retro
+# catalog can take a submission's identity from this file rather than ask
+# the submitter to hash the ROM again. The build verifies on crc32/sha256.
+expected_crc32  = 84da7cfe
+expected_md5    = ede82658dafdd6febbfbe6a9c9082500
+expected_sha1   = 265886e3f665adf2507e7b2f08b6b2ed9d0018b2
+expected_sha256 = a93ea87fc835c530b5135c5294433d15eef6dbf656144b387e89ac19cf864996
+rom_size        = 1048576
+mapping         = lorom
+region          = USA
+# What a mod package's [[target]] game_id must name to apply to this title
+# (snesrecomp/docs/MOD_PACKAGES.md). Stable across revisions on purpose.
+game_id         = contraiii-usa

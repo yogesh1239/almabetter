@@ -1,0 +1,104 @@
+diff --git a/runner/src/desktop/host_main.c b/runner/src/desktop/host_main.c
+index 3bc3905..f22afe8 100644
+--- a/runner/src/desktop/host_main.c
++++ b/runner/src/desktop/host_main.c
+@@ -418,7 +418,8 @@ static uint64_t g_state_generation;
+ 
+ /* The last field actually presented, kept so an overlay can freeze the guest
+  * and still have something to draw behind itself. Sized like g_my_pixels. */
+-static uint8_t g_frozen_frame[kSnesDesktopMaxFrameWidth * 4 * 240];
++static uint8_t g_frozen_frame[kSnesDesktopMaxFrameWidth * 4 * 240 *
++                              kSnesDesktopMaxRenderScale * kSnesDesktopMaxRenderScale];
+ static int g_frozen_w, g_frozen_h;
+ /* The simulated frame the next present shows. Read by SNESRECOMP_SCREENSHOT
+  * and by frame blending, which advances its kept frame once per simulated
+@@ -431,7 +432,8 @@ static unsigned g_present_frame;
+ #if defined(SNESRECOMP_HOST_HAS_BLEND) || SNESRECOMP_FRAME_STAGING_HLE
+ /* Compose where reads are cheap, then upload with a write-only row copy.
+  * The frozen overlay snapshot and optional OSD/blend read this frame. */
+-static uint8 g_frame_stage[kSnesDesktopMaxFrameWidth * 4 * 240];
++static uint8 g_frame_stage[kSnesDesktopMaxFrameWidth * 4 * 240 *
++                           kSnesDesktopMaxRenderScale * kSnesDesktopMaxRenderScale];
+ #endif
+ 
+ static GamepadInfo g_gamepad[kSnesHostPadSeats];
+@@ -1283,7 +1285,10 @@ static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
+ static void DrawPpuFrameWithPerf(void) {
+   double profile_start = ProfileStart();
+   PreparePpuFrame();
+-  const int render_scale = 1;
++  int render_scale = g_game->render_scale ? g_game->render_scale() : 1;
++  if (render_scale < 1 || render_scale > kSnesDesktopMaxRenderScale ||
++      g_snes_width * render_scale > kSnesDesktopMaxFrameWidth * 2)
++    render_scale = 1;
+   uint8 *present_buffer = 0;
+   int present_pitch = 0;
+ 
+@@ -4206,7 +4211,10 @@ error_reading:;
+      * being skipped costs work for a picture nobody is reading. */
+     bool runahead_captured = false;
+     {
+-      const uint32 word = inputs | GetActiveControllers() | debug_server_get_controller_active_mask();
++      uint32 extra = 0;
++      if (game->extra_inputs)
++        extra = (game->extra_inputs() & 0xfffu) | (1u << 30);
++      const uint32 word = inputs | extra | GetActiveControllers() | debug_server_get_controller_active_mask();
+       if (g_turbo || !snes_runahead_run_frame(word))
+         RtlRunFrame(word);
+       else
+diff --git a/runner/src/desktop/host_main.h b/runner/src/desktop/host_main.h
+index 03b6f06..029280e 100644
+--- a/runner/src/desktop/host_main.h
++++ b/runner/src/desktop/host_main.h
+@@ -41,6 +41,7 @@
+ 
+ /* Compositor surfaces may be wider than the guest PPU's own line buffer. */
+ enum { kSnesDesktopMaxFrameWidth = 1024 };
++enum { kSnesDesktopMaxRenderScale = 4 };
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -197,6 +198,13 @@ typedef struct SnesDesktopHostGame {
+   /* After the gameplay loop ends, before SDL resources are destroyed or a
+    * relaunch begins. Stop title-owned workers here. No further frames run. */
+   void (*on_shutdown)(void);
++  /* Internal resolution: the presenter's frame is frame_w*N x frame_h*N and
++   * draw_frame must fill all of it (its pitch says so). NULL or a return
++   * outside 2..kSnesDesktopMaxRenderScale presents at native size. */
++  int (*render_scale)(void);
++  /* Extra player-1 buttons OR-ed into the pad each frame (SNES_PAD_* bits),
++   * e.g. an on-screen touch pad. Non-NULL also marks seat 1 as connected. */
++  uint32_t (*extra_inputs)(void);
+ } SnesDesktopHostGame;
+ 
+ /* The whole program. Returns the process exit code. */
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 25dcfe0..a33f416 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -702,14 +702,22 @@ static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
+ 
+ /* Frame of the last OAM ring snapshot; see the note in ppu_runLine. Debug
+  * instrumentation only -- it never affects rendering. */
+-static int s_oam_snap_frame = -1;
++/* Thread-local: hosts may rasterize private PPU copies on worker threads
++ * (Contra III's sub-pixel passes); the guest-facing values stay the main
++ * thread's. */
++#if defined(_MSC_VER)
++#define PPU_THREAD_LOCAL __declspec(thread)
++#else
++#define PPU_THREAD_LOCAL _Thread_local
++#endif
++static PPU_THREAD_LOCAL int s_oam_snap_frame = -1;
+ 
+ /* PPU register write journal -- see ppu.h. */
+ #define PPU_WLOG_CAP (1u << 17)
+ static PpuWlogEntry s_wlog[PPU_WLOG_CAP];
+ static uint32_t s_wlog_head;          /* total entries ever written */
+-static int s_wlog_line = kPpuWlogPreRaster;
+-static uint32_t s_wlog_line_frame = 0xffffffffu;
++static PPU_THREAD_LOCAL int s_wlog_line = kPpuWlogPreRaster;
++static PPU_THREAD_LOCAL uint32_t s_wlog_line_frame = 0xffffffffu;
+ uint8_t g_ppu_wlog_src = kPpuWlogCpu;
+ 
+ void ppu_wlog_note_reg(uint16_t reg, uint8_t val) {

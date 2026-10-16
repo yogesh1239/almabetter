@@ -1,0 +1,312 @@
+/* Contra III frame driver: the framework's beam-aligned driver
+ * (snesrecomp/runner/src/beam_frame_driver.c) with one change, NMI delivery.
+ *
+ * Contra III runs its whole game loop inside the NMI handler ($00:819B). The
+ * handler re-arms itself with $3C and, mid-frame, waits for the NEXT NMI in a
+ * spin at $00:85EC (STA #$80 -> $3C, then LDA $3C / BMI). The nested NMI sees
+ * $3C != 0, stores 1 and RTIs straight back into that spin, which releases it.
+ *
+ * The stock driver runs NMI through interp_bridge_run_interrupt(), which runs
+ * to RTI and ignores the field deadline. Here that handler never returns
+ * within a field, so the bridge hit its step cap, abandoned the handler
+ * context and resumed the main thread -- the game froze on a black screen.
+ *
+ * Instead the NMI frame is pushed and the whole program keeps running in
+ * auto-quiescent mode against the field deadline, exactly like the main
+ * thread. A handler still running at V=225 yields with its context (stack,
+ * resume PC) intact, and the next field's NMI stacks on top of it as the
+ * hardware does. */
+#include "contra_frame_driver.h"
+#include "snes/interp_bridge.h"
+
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include "common_cpu_infra.h"
+#include "common_rtl.h"
+#include "cpu_state.h"
+#include "snes/cart.h"
+#include "snes/cx4.h"
+#include "snes/dma.h"
+#include "snes/interp_bridge.h"
+#include "snes/ppu.h"
+#include "snes/sa1.h"
+#include "snes/snes.h"
+#include "snes/superfx.h"
+
+extern CpuState g_cpu;
+extern Ppu *g_ppu;
+
+/* One NTSC field: 262 scanlines x 1364 master clocks. */
+#define BFD_MASTER_CYCLES_PER_FIELD 357368ull
+#define BFD_MASTER_CYCLES_PER_LINE 1364u
+#define BFD_VBLANK_LINE 225u
+
+/* Bounds the run/park loop: a field holds 262 one-line park steps plus the
+ * slices and interrupts between them. Only a pathological guest reaches it. */
+#define BFD_MAX_SLICES_PER_FIELD 1024
+
+/* 0 until the first frame has booted from the reset vector. */
+static uint32_t s_resume_pc;
+
+/* The CPU executed WAI and is halted until an interrupt line asserts. */
+static bool s_wai_halted;
+
+/* ── Idle parking ────────────────────────────────────────────────────────────
+ * Contra III spends most of every field in two polls that only an interrupt
+ * can satisfy:
+ *
+ *   $00:8166  main thread: JSL $995A / BRA $8166, where $995A returns at once
+ *             unless the NMI side has posted a job ($52 == $00FF).
+ *   $00:85EC  inside the NMI handler: LDA $003C / BMI $85EC, waiting for the
+ *             nested NMI to clear bit 7.
+ *
+ * Interpreting those spins cost ~45% of all guest instructions. At either PC,
+ * with the poll's condition still unmet, nothing in the machine depends on
+ * the CPU until an interrupt arrives, so the CPU is parked exactly like WAI:
+ * the beam, APU and HDMA run on, raster IRQs are still taken where they
+ * latch, and the handler returns into the same poll. The checks pin the
+ * register widths, direct page and data bank the polls run with, so any other
+ * path through these PCs interprets normally. */
+extern uint8_t g_ram[0x20000];
+static bool s_idle;
+
+static bool db_maps_low_wram(uint8_t db) {
+  return (db & 0x7f) < 0x40;
+}
+
+static void idle_hook(CpuState *cpu, uint32_t pc24) {
+  bool idle = false;
+  switch (pc24 & 0x7fffffu) {
+  case 0x008166: /* JSL $995A: REP #$20 / LDA $52 / CMP #$00FF / BNE rtl */
+    idle = cpu->D == 0 && !cpu->emulation &&
+           (g_ram[0x52] | (g_ram[0x53] << 8)) != 0x00ff;
+    break;
+  case 0x0085EC: /* LDA $003C (8-bit) / BMI $85EC */
+    idle = cpu->m_flag && !cpu->emulation && db_maps_low_wram(cpu->DB) &&
+           (g_ram[0x3c] & 0x80);
+    break;
+  }
+  if (!idle)
+    return;
+  /* Yield before this instruction: the deadline check at the top of the
+   * interpreter loop fires on the redirect back to the same PC. */
+  s_idle = true;
+  interp_bridge_set_master_deadline(cpu->master_cycles);
+  interp_bridge_pre_opcode_redirect(pc24);
+}
+
+static void idle_hooks_install(void) {
+  static bool installed;
+  if (installed)
+    return;
+  installed = true;
+  if (getenv("CONTRA_NO_IDLE_PARK"))
+    return;
+  interp_bridge_add_pre_opcode_hook(0x008166, idle_hook);
+  interp_bridge_add_pre_opcode_hook(0x0085EC, idle_hook);
+}
+
+static uint32_t read_vector(uint32_t addr) {
+  /* Through the guest bus, so a mapper or coprocessor window resolves the
+   * vector the way the CPU sees it. */
+  uint32_t lo = snes_read(g_snes, addr);
+  uint32_t hi = snes_read(g_snes, addr + 1u);
+  return (hi << 8) | lo;
+}
+
+static uint32_t reset_vector(void) { return read_vector(0x00FFFCu); }
+static uint32_t nmi_vector(void) { return read_vector(0x00FFEAu); }
+static uint32_t irq_vector(void) { return read_vector(0x00FFEEu); }
+
+static void update_resume_pc(void) {
+  uint32_t resume = interp_bridge_lle_resume_pc();
+  if (resume)
+    s_resume_pc = resume;
+}
+
+/* A cartridge coprocessor holding the CPU IRQ line. The bridge yields to this
+ * scheduler the moment one is pending with I clear, so the CPU half has to
+ * deliver it -- Doom chains its GSU tasks off exactly this interrupt. */
+static bool cart_irq_pending(void) {
+  const Cart *cart = g_snes->cart;
+  if (!cart)
+    return false;
+  if (cart->superfx && cart->superfx->irq_pending)
+    return true;
+  if (cart->cx4 && cx4_irq_pending(cart->cx4))
+    return true;
+  if (cart->sa1 && sa1_cpu_irq_pending(cart->sa1))
+    return true;
+  return false;
+}
+
+static bool irq_line_asserted(void) {
+  return g_snes->inIrq || cart_irq_pending();
+}
+
+static bool irq_wanted(void) {
+  return !g_cpu._flag_I && irq_line_asserted();
+}
+
+/* Master clocks the CPU has spent that the beam has not walked yet: the walk
+ * stops one clock past an IRQ latch and owes the rest. */
+static uint64_t beam_debt(void) {
+  return g_cpu.master_cycles > g_snes->beamMasterLast
+             ? g_cpu.master_cycles - g_snes->beamMasterLast
+             : 0;
+}
+
+/* Parked time: the beam, APU and coprocessors advance; the CPU does not. */
+static void advance_parked(uint64_t until) {
+  g_cpu.master_cycles = until;
+  snes_refresh_exempt();
+  snes_sync_master_clock(g_snes, g_cpu.master_cycles);
+  cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+}
+
+static void run_interrupt(uint32_t vector, uint64_t deadline) {
+  /* The beam keeps running through the handler, as on hardware. A held beam
+   * cannot satisfy a handler that polls it -- Doom's reads OPVCT to choose its
+   * split, then waits for H-blank -- and the handler spins to the step cap.
+   * The bridge yields at the instruction that latched the IRQ, so the handler
+   * already starts where the real CPU would take it. */
+  cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+  interp_bridge_set_master_deadline(deadline);
+  (void)interp_bridge_run_interrupt(&g_cpu, vector);
+  /* A deadline left armed stays true for every AOT block prologue afterwards
+   * and turns each compiled body into an immediate yield. */
+  interp_bridge_set_master_deadline(0);
+  update_resume_pc();
+}
+
+void contra_frame_driver_run_frame(void) {
+  const bool booting = s_resume_pc == 0;
+  int slices = 0;
+  uint64_t frame_end;
+
+  /* The field ends at the beam's next V=225, measured from the BEAM: the
+   * walk below leaves it exactly there, and the CPU clock may already be past
+   * it (a long instruction, or clocks owed after a latch). A boundary kept on
+   * a CPU-time grid drifted from the field, so NMI arrived wherever the
+   * previous frame happened to stop: Doom brackets each VRAM upload with
+   * INIDISP=$80 ... $0F in vblank, the $80 landed before a raster walk and the
+   * $0F after it, and two of every seven gameplay frames drew black. */
+  {
+    uint32_t to_vblank = snes_master_clocks_until_line(g_snes, BFD_VBLANK_LINE);
+    frame_end = g_snes->beamMasterLast +
+                (to_vblank ? to_vblank : BFD_MASTER_CYCLES_PER_FIELD);
+  }
+
+  if (booting) {
+    idle_hooks_install();
+    s_resume_pc = reset_vector();
+  } else {
+    /* Vblank-edge PPU work a frame-model host owns: OAMADDR re-latches. */
+    ppu_checkOverscan(g_ppu);
+    ppu_handleVblank(g_ppu);
+  }
+  /* The render walk owns HDMA (see draw) and the CPU half owns the H/V
+   * comparator. Re-asserted per frame: a save-state load restores Snes. */
+  snes_set_hdma_beam_enabled(g_snes, false);
+  snes_set_raster_irq_beam_enabled(true);
+  ppu_rasterBegin(g_ppu);
+
+  /* NMITIMEN gates NMI; nothing is delivered before reset has run, since
+   * there is no instruction stream to interrupt yet. */
+  if (!booting && g_snes->nmiEnabled) {
+    g_snes->inNmi = true;
+    s_wai_halted = false;
+    cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+    s_resume_pc = nmi_vector();
+    g_snes->inNmi = false;
+  }
+
+  /* Run out the field, taking each interrupt at the beam position it latches
+   * at -- not from the render walk afterwards, where the beam is parked at
+   * V=225 and a handler that reads OPVCT sees the wrong line. */
+  while (g_cpu.master_cycles < frame_end && slices++ < BFD_MAX_SLICES_PER_FIELD) {
+    uint64_t next;
+    uint32_t to_irq;
+
+    /* WAI halts the CPU until an interrupt line asserts -- NMI (next field),
+     * a raster match or a coprocessor IRQ. With I set the IRQ wakes it
+     * without taking the vector. Resuming it after a park step instead made
+     * every WAI last one scanline: Doom times its title hold as a countdown
+     * of WAIs (`WAI / DEX / BPL`), which then ran out within the first field
+     * and skipped the title. */
+    if (s_wai_halted && irq_line_asserted())
+      s_wai_halted = false;
+    if (!s_wai_halted && !irq_wanted()) {
+      interp_bridge_set_master_deadline(frame_end);
+      (void)interp_bridge_run_until_quiescent(&g_cpu, s_resume_pc);
+      interp_bridge_set_master_deadline(0);
+      update_resume_pc();
+      if (interp_bridge_lle_took_wai())
+        s_wai_halted = true;
+      if (s_idle) {
+        s_idle = false;
+        s_wai_halted = true;
+      }
+    }
+    /* Past the boundary, an interrupt belongs to the next frame. Delivering
+     * one with the deadline already spent made the handler yield on its first
+     * instruction, and the next delivery stacked a second interrupt frame on
+     * top: Doom's bottom split DMAs from line 199 across V=225 (the forced-
+     * blank borders exist to give it that time), so this was every field. */
+    if (g_cpu.master_cycles >= frame_end)
+      break;
+    if (irq_wanted()) {
+      s_wai_halted = false;
+      run_interrupt(irq_vector(), frame_end);
+      continue;
+    }
+    /* Pay the beam what it owes first: those clocks can latch the next
+     * split. */
+    if (beam_debt()) {
+      snes_sync_master_clock(g_snes, g_cpu.master_cycles);
+      cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+      continue;
+    }
+    /* Parked on a poll or halted on WAI with field time left: hardware time
+     * still passes.
+     * Ending the CPU half here instead also took that time from the
+     * coprocessors, which run on the same master clock. Step to the next H/V
+     * match when it is nearer than a line (+1: the comparator window excludes
+     * its end), a line otherwise, so a raster IRQ or a GSU STOP is seen
+     * within a line of hardware raising it. */
+    to_irq = snes_master_clocks_until_irq(g_snes);
+    if (to_irq)
+      to_irq += 1;
+    if (to_irq == 0 || to_irq > BFD_MASTER_CYCLES_PER_LINE)
+      to_irq = BFD_MASTER_CYCLES_PER_LINE;
+    next = g_cpu.master_cycles + to_irq;
+    if (next > frame_end)
+      next = frame_end;
+    advance_parked(next);
+  }
+
+  /* Walk the beam to the boundary -- not past it: clocks the CPU spent
+   * beyond it belong to the next field. Reaching V=225 closes this field's
+   * raster journal (ppu_rasterFieldBoundary). */
+  {
+    int walk = 0;
+    if (g_cpu.master_cycles < frame_end) /* slices exhausted */
+      advance_parked(frame_end);
+    while (g_snes->beamMasterLast < frame_end && walk++ < 1200) {
+      uint64_t before = g_snes->beamMasterLast;
+      uint64_t want = frame_end - before;
+      snes_advance_master_cycles(g_snes, want > UINT32_MAX ? UINT32_MAX : (uint32_t)want);
+      if (g_snes->beamMasterLast == before)
+        break;
+    }
+    cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+  }
+}
+
+void contra_frame_driver_reset(void) {
+  s_resume_pc = 0;
+  s_wai_halted = false;
+  s_idle = false;
+}

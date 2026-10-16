@@ -1,0 +1,49 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The native side is the port's own CMake project (../../CMakeLists.txt):
+// the framework runtime, the recompiled game (src/gen, generated locally from
+// the player's ROM by tools/regen.sh) and SDL3, linked into libmain.so.
+android {
+    namespace = "com.contra3.recomp"
+    compileSdk 35
+    ndkVersion = "27.2.12479018"
+    defaultConfig {
+        applicationId "com.contra3.recomp"
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0"
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_static"
+                if (project.hasProperty('SDL3_SOURCE_DIR')) {
+                    arguments "-DSNESRECOMP_SDL3_SOURCE_DIR=${project.property('SDL3_SOURCE_DIR')}"
+                }
+                abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Signed with the debug key so the APK installs as built; use
+            // your own keystore for anything you publish.
+            signingConfig signingConfigs.debug
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path file('../../CMakeLists.txt')
+            version "3.22.1"
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    lint {
+        abortOnError = false
+    }
+}
